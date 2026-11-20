@@ -18,7 +18,7 @@ use language::{CharKind, DiagnosticEntry, Language, LanguageRegistry};
 use lsp::DiagnosticSeverity;
 use markdown::{CopyButtonVisibility, Markdown, MarkdownElement, MarkdownStyle};
 use multi_buffer::{MultiBufferOffset, MultiBufferSnapshot, ToOffset, ToPoint};
-use project::{HoverBlock, HoverBlockKind, InlayHintLabelPart};
+use project::{HoverBlock, HoverBlockKind, InlayHintLabelPart, project_settings::ProjectSettings};
 use settings::Settings;
 use std::{
     borrow::Cow,
@@ -26,6 +26,7 @@ use std::{
 };
 use std::{ops::Range, sync::Arc, time::Duration};
 use std::{path::PathBuf, rc::Rc};
+use sum_tree::Bias;
 use theme_settings::ThemeSettings;
 use ui::{CopyButton, Scrollbars, WithScrollbar, prelude::*, theme_is_transparent};
 use url::Url;
@@ -262,11 +263,14 @@ fn show_hover(
 
     editor.hover_state.hiding_delay_task = None;
     editor.hover_state.closest_mouse_distance = None;
+    let underline_full_line = ProjectSettings::get_global(cx)
+        .diagnostics
+        .underline_full_line;
 
     if !ignore_timeout {
         if same_info_hover(editor, &snapshot, anchor)
-            || same_diagnostic_hover(editor, &snapshot, anchor)
-            || editor.hover_state.diagnostic_popover.is_some()
+            || same_diagnostic_hover(editor, &snapshot, anchor, underline_full_line)
+            || (!underline_full_line && editor.hover_state.diagnostic_popover.is_some())
         {
             // Hover triggered from same location as last time. Don't show again.
             return None;
@@ -313,14 +317,45 @@ fn show_hover(
             let local_diagnostic = if all_diagnostics_active {
                 None
             } else {
+                let display = &snapshot.display_snapshot;
+                let row = anchor.to_display_point(display).row();
+                let hover_range = if underline_full_line {
+                    DisplayPoint::new(row, 0).to_offset(display, Bias::Left)
+                        ..DisplayPoint::new(row, display.line_len(row))
+                            .to_offset(display, Bias::Right)
+                } else {
+                    offset..offset
+                };
                 snapshot
                     .buffer_snapshot()
-                    .diagnostics_with_buffer_ids_in_range::<MultiBufferOffset>(offset..offset)
+                    .diagnostics_with_buffer_ids_in_range::<MultiBufferOffset>(hover_range.clone())
                     .filter(|(_, diagnostic)| {
                         Some(diagnostic.diagnostic.group_id) != active_group_id
                     })
-                    // Find the entry with the most specific range
-                    .min_by_key(|(_, entry)| entry.range.end - entry.range.start)
+                    .filter(|(_, entry)| {
+                        if !underline_full_line {
+                            return true;
+                        }
+                        let diagnostic = entry.diagnostic;
+                        let overlaps_row = if entry.range.is_empty() {
+                            entry.range.start.to_display_point(display).row() == row
+                                && !display.intersects_fold(entry.range.start)
+                        } else {
+                            entry.range.start < hover_range.end
+                                && hover_range.start < entry.range.end
+                        };
+                        overlaps_row
+                            && diagnostic.underline
+                            && display.diagnostic_severity_is_visible(diagnostic.severity)
+                            && !(diagnostic.is_unnecessary
+                                && diagnostic.severity > DiagnosticSeverity::WARNING)
+                    })
+                    .min_by_key(|(_, entry)| {
+                        (
+                            underline_full_line.then_some(entry.diagnostic.severity),
+                            entry.range.end - entry.range.start,
+                        )
+                    })
             };
 
             let diagnostic_popover = if let Some((buffer_id, local_diagnostic)) = local_diagnostic {
@@ -769,12 +804,22 @@ fn same_info_hover(editor: &mut Editor, snapshot: &EditorSnapshot, anchor: Ancho
     )
 }
 
-fn same_diagnostic_hover(editor: &Editor, snapshot: &EditorSnapshot, anchor: Anchor) -> bool {
+fn same_diagnostic_hover(
+    editor: &Editor,
+    snapshot: &EditorSnapshot,
+    anchor: Anchor,
+    underline_full_line: bool,
+) -> bool {
     editor
         .hover_state
         .diagnostic_popover
         .as_ref()
         .map(|diagnostic| {
+            if underline_full_line {
+                let display = &snapshot.display_snapshot;
+                return diagnostic.anchor.to_display_point(display).row()
+                    == anchor.to_display_point(display).row();
+            }
             let hover_range = diagnostic
                 .local_diagnostic
                 .range
@@ -1339,7 +1384,16 @@ impl HoverState {
         let anchor = self
             .diagnostic_popover
             .as_ref()
-            .map(|diagnostic_popover| &diagnostic_popover.local_diagnostic.range.start)
+            .map(|diagnostic_popover| {
+                if ProjectSettings::get_global(cx)
+                    .diagnostics
+                    .underline_full_line
+                {
+                    &diagnostic_popover.anchor
+                } else {
+                    &diagnostic_popover.local_diagnostic.range.start
+                }
+            })
             .or_else(|| {
                 self.info_popovers.iter().find_map(|info_popover| {
                     match &info_popover.symbol_range {
@@ -4027,6 +4081,73 @@ mod tests {
             assert!(
                 !editor.hover_state.visible(),
                 "Popover should hide after the restarted hiding timer expires"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_hover_diagnostic_outside_span_on_underlined_line(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .diagnostics
+                        .get_or_insert_default()
+                        .underline_full_line = Some(true);
+                });
+            });
+            crate::set_diagnostic_renderer(TestDiagnosticRenderer, cx);
+        });
+
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+        cx.set_state("ˇlet affected = 1;\nlet adjacent = 2;\n");
+        cx.lsp
+            .set_request_handler::<lsp::request::HoverRequest, _, _>(|_, _| async { Ok(None) });
+        cx.lsp
+            .notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
+                uri: cx.buffer_lsp_url.clone(),
+                diagnostics: vec![lsp::Diagnostic {
+                    range: lsp::Range::new(lsp::Position::new(0, 4), lsp::Position::new(0, 12)),
+                    severity: Some(lsp::DiagnosticSeverity::ERROR),
+                    message: lsp::DiagnosticMessage::from("diagnostic".to_string()),
+                    ..Default::default()
+                }],
+                version: None,
+            });
+        cx.run_until_parked();
+
+        let hover_delay = Duration::from_millis(get_hover_popover_delay(&cx) + 100);
+        let adjacent_line = cx.pixel_position_for(DisplayPoint::new(DisplayRow(1), 1));
+        cx.simulate_mouse_move(adjacent_line, None, Modifiers::none());
+        cx.background_executor.advance_clock(hover_delay);
+        cx.editor(|editor, _, _| {
+            assert!(editor.hover_state.diagnostic_popover.is_none());
+        });
+
+        let outside_span = cx.pixel_position_for(DisplayPoint::new(DisplayRow(0), 15));
+        cx.simulate_mouse_move(outside_span, None, Modifiers::none());
+        cx.background_executor.advance_clock(hover_delay);
+        cx.editor(|editor, _, _| {
+            assert!(
+                editor.hover_state.diagnostic_popover.is_some(),
+                "hovering the underlined row outside the diagnostic span should show its message"
+            );
+        });
+
+        cx.simulate_mouse_move(adjacent_line, None, Modifiers::none());
+        cx.background_executor.advance_clock(hover_delay);
+        cx.editor(|editor, _, _| {
+            assert!(
+                editor.hover_state.diagnostic_popover.is_none(),
+                "moving to an unaffected row should dismiss the diagnostic message"
             );
         });
     }

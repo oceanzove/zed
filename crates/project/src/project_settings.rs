@@ -703,6 +703,9 @@ pub struct DiagnosticsSettings {
     /// Whether or not to include warning diagnostics.
     pub include_warnings: bool,
 
+    /// Underline the entire displayed line for a diagnostic.
+    pub underline_full_line: bool,
+
     /// Settings for using LSP pull diagnostics mechanism in Zed.
     pub lsp_pull_diagnostics: LspPullDiagnosticsSettings,
 
@@ -874,6 +877,7 @@ impl Settings for ProjectSettings {
             diagnostics: DiagnosticsSettings {
                 button: diagnostics.button.unwrap(),
                 include_warnings: diagnostics.include_warnings.unwrap(),
+                underline_full_line: diagnostics.underline_full_line.unwrap_or_default(),
                 lsp_pull_diagnostics: LspPullDiagnosticsSettings {
                     enabled: lsp_pull_diagnostics.enabled.unwrap(),
                     debounce_ms: lsp_pull_diagnostics.debounce_ms.unwrap().0,

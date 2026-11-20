@@ -987,6 +987,9 @@ pub struct DiagnosticsSettingsContent {
     /// Default: true
     pub include_warnings: Option<bool>,
 
+    /// Underline the entire displayed line for a diagnostic.
+    pub underline_full_line: Option<bool>,
+
     /// Settings for using LSP pull diagnostics mechanism in Zed.
     pub lsp_pull_diagnostics: Option<LspPullDiagnosticsSettingsContent>,
 

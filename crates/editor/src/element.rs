@@ -20,7 +20,7 @@ use crate::{
     cursor_animation::{CursorViewport, LogicalCursorPosition, animated_corners_overlap_target},
     display_map::{
         Block, BlockContext, BlockStyle, ChunkRendererId, DisplaySnapshot, EditorMargins,
-        HighlightKey, HighlightedChunk, ToDisplayPoint,
+        HighlightKey, HighlightedChunk, ToDisplayPoint, diagnostic_style,
     },
     editor_settings::{
         CurrentLineHighlight, DocumentColorsRenderMode, GitGutterWidth, Minimap, MinimapThumb,
@@ -86,7 +86,7 @@ use std::{
 };
 use sum_tree::Bias;
 use text::{BufferId, ToPoint as _};
-use theme::{ActiveTheme, Appearance, PlayerColor};
+use theme::{ActiveTheme, Appearance, PlayerColor, StatusColors};
 use theme_settings::BufferLineHeight;
 use ui::utils::ensure_minimum_contrast;
 use ui::{ButtonLike, POPOVER_Y_PADDING, Tooltip, prelude::*, scrollbars::ShowScrollbar};
@@ -7956,16 +7956,39 @@ impl LineWithInvisibles {
         cx: &mut App,
     ) {
         let line_height = layout.position_map.line_height;
-        let mut fragment_origin = content_origin
+        let line_origin = content_origin
             + point(
                 self.alignment_offset(layout.text_align, layout.content_width)
                     - Pixels::from(layout.position_map.scroll_pixel_position.x),
                 line_y,
             );
+        let mut fragment_origin = line_origin;
+        let full_line_underline = layout
+            .full_line_diagnostic_colors
+            .as_ref()
+            .and_then(|colors| {
+                let severity = self
+                    .diagnostic_underline_severity_ranges
+                    .iter()
+                    .map(|&(_, severity)| severity)
+                    .chain(
+                        self.point_diagnostics
+                            .iter()
+                            .map(|diagnostic| diagnostic.severity),
+                    )
+                    .min()?;
+                Some(UnderlineStyle {
+                    color: Some(diagnostic_style(severity, colors)),
+                    thickness: px(1.),
+                    wavy: true,
+                })
+            });
         let mut points = self
             .point_diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.column as usize <= self.len)
+            .filter(|diagnostic| {
+                full_line_underline.is_none() && diagnostic.column as usize <= self.len
+            })
             .collect::<SmallVec<[_; 4]>>();
         points.sort_unstable_by_key(|diagnostic| diagnostic.column);
         let has_points = !points.is_empty();
@@ -7978,7 +8001,7 @@ impl LineWithInvisibles {
         for fragment in &self.fragments {
             let (fragment_len, fragment_width, line) = match fragment {
                 LineFragment::Text(line) => {
-                    if has_points {
+                    if has_points || full_line_underline.is_some() {
                         let mut glyphs = line.runs.iter().flat_map(|run| &run.glyphs).peekable();
                         line.paint_with_underline_handler(
                             fragment_origin,
@@ -8042,15 +8065,17 @@ impl LineWithInvisibles {
                                     };
                                     if span_start < span_end {
                                         if let Some(severity) = severity {
-                                            underlines.push(DiagnosticUnderline {
-                                                origin,
-                                                width,
-                                                style: *style,
-                                                bounds,
-                                                span: span_start..span_end,
-                                                severity,
-                                                is_point: false,
-                                            });
+                                            if full_line_underline.is_none() {
+                                                underlines.push(DiagnosticUnderline {
+                                                    origin,
+                                                    width,
+                                                    style: *style,
+                                                    bounds,
+                                                    span: span_start..span_end,
+                                                    severity,
+                                                    is_point: false,
+                                                });
+                                            }
                                         } else {
                                             window.paint_underline_with_exclusions(
                                                 origin,
@@ -8153,6 +8178,33 @@ impl LineWithInvisibles {
             cx,
         );
         DiagnosticUnderline::paint_all(&underlines, window);
+        if let Some(style) = full_line_underline {
+            let indentation = layout
+                .position_map
+                .snapshot
+                .display_snapshot
+                .text_chunks(row)
+                .flat_map(str::chars)
+                .take_while(|character| *character != '\n' && character.is_whitespace())
+                .map(char::len_utf8)
+                .sum();
+            let start = self.x_for_index(indentation);
+            let offset = self
+                .fragments
+                .iter()
+                .find_map(|fragment| match fragment {
+                    LineFragment::Text(line) if !line.runs.is_empty() => {
+                        Some(underline_y_offset(line_height, line.ascent, line.descent))
+                    }
+                    _ => None,
+                })
+                .unwrap_or(layout.point_diagnostic_underline_offset);
+            window.paint_underline(
+                line_origin + point(start, offset),
+                (fragment_origin.x - line_origin.x - start).max(layout.position_map.em_advance),
+                &style,
+            );
+        }
     }
 
     fn draw_background(
@@ -10111,6 +10163,10 @@ impl Element for EditorElement {
                         line_numbers,
                         blamed_display_rows,
                         inline_diagnostics,
+                        full_line_diagnostic_colors: ProjectSettings::get_global(cx)
+                            .diagnostics
+                            .underline_full_line
+                            .then(|| self.style.status.clone()),
                         point_diagnostic_underline_offset,
                         inline_blame_layout,
                         inline_code_actions,
@@ -10320,6 +10376,7 @@ pub struct EditorLayout {
     display_hunks: Vec<(DisplayDiffHunk, Option<Hitbox>)>,
     blamed_display_rows: Option<Vec<AnyElement>>,
     inline_diagnostics: HashMap<DisplayRow, AnyElement>,
+    full_line_diagnostic_colors: Option<StatusColors>,
     point_diagnostic_underline_offset: Pixels,
     inline_blame_layout: Option<InlineBlameLayout>,
     inline_code_actions: Option<AnyElement>,
@@ -12036,6 +12093,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[gpui::test]
+    fn test_full_line_diagnostic_underlines_cover_each_affected_row_once(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .diagnostics
+                        .get_or_insert_default()
+                        .underline_full_line = Some(true);
+                });
+            });
+        });
+
+        let point_in_text = PointUtf16::new(1, 2);
+        let point_on_empty_row = PointUtf16::new(2, 0);
+        let buffer = point_diagnostic_buffer(
+            "  bc\n\tiabc\n\nsafe",
+            [
+                (PointUtf16::new(0, 2)..PointUtf16::new(0, 3), WARNING),
+                (PointUtf16::new(1, 1)..PointUtf16::new(1, 2), WARNING),
+                (point_in_text..point_in_text, ERROR),
+                (point_on_empty_row..point_on_empty_row, WARNING),
+            ],
+            cx,
+        );
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let (window, _) = point_diagnostic_editor(multi_buffer, cx);
+        cx.simulate_window_scale_factor_change(window.into(), 2.);
+        assert_painted_point_diagnostics(
+            window,
+            &[
+                (0, 31..62, WARNING),
+                (1, 62..124, ERROR),
+                (2, 0..16, WARNING),
+            ],
+            cx,
+        );
     }
 
     #[gpui::test]

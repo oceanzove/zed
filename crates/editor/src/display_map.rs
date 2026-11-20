@@ -1589,7 +1589,7 @@ impl DisplaySnapshot {
         self.diagnostics_max_severity.into_lsp().is_some()
     }
 
-    fn diagnostic_severity_is_visible(&self, severity: lsp::DiagnosticSeverity) -> bool {
+    pub(crate) fn diagnostic_severity_is_visible(&self, severity: lsp::DiagnosticSeverity) -> bool {
         self.diagnostics_max_severity
             .into_lsp()
             .is_some_and(|max_severity| severity <= max_severity)
@@ -2576,7 +2576,7 @@ impl DisplaySnapshot {
     }
 }
 
-fn diagnostic_style(severity: lsp::DiagnosticSeverity, colors: &StatusColors) -> Hsla {
+pub(crate) fn diagnostic_style(severity: lsp::DiagnosticSeverity, colors: &StatusColors) -> Hsla {
     match severity {
         lsp::DiagnosticSeverity::ERROR => colors.error,
         lsp::DiagnosticSeverity::WARNING => colors.warning,
