@@ -652,6 +652,9 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_right_item(pending_keystrokes_indicator, window, cx);
         });
 
+        #[cfg(target_os = "macos")]
+        crate::ios_preview::register(workspace, window, cx);
+
         let panels_task = initialize_panels(window, cx);
         workspace.set_panels_task(panels_task);
         register_actions(app_state.clone(), workspace, window, cx);
