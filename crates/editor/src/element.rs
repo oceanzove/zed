@@ -1904,6 +1904,7 @@ impl EditorElement {
         crease_trailers: &[Option<CreaseTrailerLayout>],
         row_block_types: &HashMap<DisplayRow, bool>,
         content_origin: gpui::Point<Pixels>,
+        available_right: Pixels,
         scroll_position: gpui::Point<ScrollOffset>,
         scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
         edit_prediction_popover_origin: Option<gpui::Point<Pixels>>,
@@ -1930,7 +1931,14 @@ impl EditorElement {
             .flatten()
         {
             Some(max_severity) => max_severity,
-            None => return HashMap::default(),
+            None => {
+                self.defer_overflow_diagnostics(
+                    DisplayRow(0)..DisplayRow(u32::MAX),
+                    HashMap::default(),
+                    cx,
+                );
+                return HashMap::default();
+            }
         };
 
         let active_diagnostics_group = self.editor.read(cx).active_diagnostic_group_id();
@@ -1948,7 +1956,12 @@ impl EditorElement {
                     }
                     None => true,
                 })
-                .map(|(point, diag)| (point.to_display_point(&snapshot), diag.clone()))
+                .map(|(anchor, diagnostic)| {
+                    (
+                        anchor.to_display_point(&snapshot),
+                        (*anchor, diagnostic.clone()),
+                    )
+                })
                 .skip_while(|(point, _)| point.row() < start_row)
                 .take_while(|(point, _)| point.row() < end_row)
                 .filter(|(point, _)| !row_block_types.contains_key(&point.row()))
@@ -1961,6 +1974,7 @@ impl EditorElement {
         });
 
         if diagnostics_by_rows.is_empty() {
+            self.defer_overflow_diagnostics(start_row..end_row, HashMap::default(), cx);
             return HashMap::default();
         }
 
@@ -1983,8 +1997,9 @@ impl EditorElement {
         );
 
         let mut elements = HashMap::default();
+        let mut overflow = HashMap::default();
         for (row, mut diagnostics) in diagnostics_by_rows {
-            diagnostics.sort_by_key(|diagnostic| {
+            diagnostics.sort_by_key(|(_, diagnostic)| {
                 (
                     diagnostic.severity,
                     std::cmp::Reverse(diagnostic.is_primary),
@@ -1993,9 +2008,9 @@ impl EditorElement {
                 )
             });
 
-            let Some(diagnostic_to_render) = diagnostics
+            let Some((anchor, diagnostic_to_render)) = diagnostics
                 .iter()
-                .find(|diagnostic| diagnostic.is_primary)
+                .find(|(_, diagnostic)| diagnostic.is_primary)
                 .or_else(|| diagnostics.first())
             else {
                 continue;
@@ -2039,7 +2054,7 @@ impl EditorElement {
             let mut element = h_flex()
                 .id(("diagnostic", row.0))
                 .h(line_height)
-                .w_full()
+                .whitespace_nowrap()
                 .px_1()
                 .rounded_xs()
                 .opacity(opacity)
@@ -2052,12 +2067,44 @@ impl EditorElement {
                 .child(diagnostic_to_render.message.clone())
                 .into_any();
 
-            element.prepaint_as_root(point(pos_x, pos_y), AvailableSpace::min_size(), window, cx);
+            let intrinsic_size = element.layout_as_root(
+                size(AvailableSpace::MaxContent, AvailableSpace::MinContent),
+                window,
+                cx,
+            );
+            if diagnostic_to_render.message.contains('\n')
+                || pos_x + Pixels::from(scroll_pixel_position.x) + intrinsic_size.width
+                    > available_right
+            {
+                overflow.insert(*anchor, diagnostic_to_render.clone());
+                continue;
+            }
+
+            element.prepaint_at(point(pos_x, pos_y), window, cx);
 
             elements.insert(row, element);
         }
 
+        self.defer_overflow_diagnostics(start_row..end_row, overflow, cx);
         elements
+    }
+
+    fn defer_overflow_diagnostics(
+        &self,
+        visible: Range<DisplayRow>,
+        overflow: HashMap<multi_buffer::Anchor, crate::diagnostics::InlineDiagnostic>,
+        cx: &mut App,
+    ) {
+        if overflow.is_empty() && self.editor.read(cx).overflow_diagnostic_blocks.is_empty() {
+            return;
+        }
+        // Changing display rows during prepaint would invalidate the current layout.
+        let editor = self.editor.clone();
+        cx.defer(move |cx| {
+            editor.update(cx, |editor, cx| {
+                editor.sync_overflow_diagnostics(visible, overflow, cx);
+            });
+        });
     }
 
     fn layout_inline_code_actions(
@@ -9482,22 +9529,27 @@ impl Element for EditorElement {
                         })
                         .unzip();
 
-                    let mut inline_diagnostics = self.layout_inline_diagnostics(
-                        &line_layouts,
-                        &crease_trailers,
-                        &row_block_types,
-                        content_origin,
-                        scroll_position,
-                        scroll_pixel_position,
-                        edit_prediction_popover_origin,
-                        start_row,
-                        end_row,
-                        line_height,
-                        em_width,
-                        style,
-                        window,
-                        cx,
-                    );
+                    let mut inline_diagnostics = if is_minimap {
+                        HashMap::default()
+                    } else {
+                        self.layout_inline_diagnostics(
+                            &line_layouts,
+                            &crease_trailers,
+                            &row_block_types,
+                            content_origin,
+                            content_origin.x + editor_width,
+                            scroll_position,
+                            scroll_pixel_position,
+                            edit_prediction_popover_origin,
+                            start_row,
+                            end_row,
+                            line_height,
+                            em_width,
+                            style,
+                            window,
+                            cx,
+                        )
+                    };
 
                     let mut inline_blame_layout = None;
                     let mut inline_code_actions = None;

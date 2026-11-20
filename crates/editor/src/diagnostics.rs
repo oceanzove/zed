@@ -43,7 +43,7 @@ impl GlobalDiagnosticRenderer {
 
 impl gpui::Global for GlobalDiagnosticRenderer {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct InlineDiagnostic {
     pub(super) message: SharedString,
     pub(super) group_id: usize,
@@ -503,17 +503,8 @@ impl Editor {
                         let message = diagnostic_entry
                             .diagnostic
                             .message
-                            .as_str()
-                            .split_once('\n')
-                            .map(|(line, _)| line)
-                            .map(SharedString::new)
-                            .unwrap_or_else(|| {
-                                diagnostic_entry
-                                    .diagnostic
-                                    .message
-                                    .as_shared_string()
-                                    .clone()
-                            });
+                            .as_shared_string()
+                            .clone();
                         let start_anchor = snapshot.anchor_before(diagnostic_entry.range.start);
                         let (Ok(i) | Err(i)) = inline_diagnostics
                             .binary_search_by(|(probe, _)| probe.cmp(&start_anchor, &snapshot));
@@ -542,6 +533,110 @@ impl Editor {
                 })
                 .ok();
         });
+    }
+
+    pub(super) fn sync_overflow_diagnostics(
+        &mut self,
+        visible: Range<DisplayRow>,
+        mut overflow: HashMap<Anchor, InlineDiagnostic>,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.display_snapshot(cx);
+        let active_group = self.active_diagnostic_group_id();
+        let buffer = snapshot.buffer_snapshot();
+        let diagnostics = &self.inline_diagnostics;
+        let mut removed = HashSet::default();
+        self.overflow_diagnostic_blocks
+            .retain(|anchor, (diagnostic, block)| {
+                let keep = if let Some(current) = overflow.get(anchor) {
+                    if current == diagnostic {
+                        overflow.remove(anchor);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    !visible.contains(&anchor.to_display_point(&snapshot).row())
+                        && active_group != Some(diagnostic.group_id)
+                        && {
+                            let first = diagnostics.partition_point(|(current, _)| {
+                                current.cmp(anchor, buffer).is_lt()
+                            });
+                            diagnostics[first..]
+                                .iter()
+                                .take_while(|(current, _)| current.cmp(anchor, buffer).is_eq())
+                                .any(|(current_anchor, current)| {
+                                    current_anchor == anchor && current == diagnostic
+                                })
+                        }
+                };
+                if !keep {
+                    removed.insert(*block);
+                }
+                keep
+            });
+        if !removed.is_empty() {
+            self.remove_blocks(removed, None, cx);
+        }
+
+        let pending: Vec<_> = overflow.into_iter().collect();
+        if pending.is_empty() {
+            return;
+        }
+        let blocks = self.insert_blocks(
+            pending.iter().map(|(anchor, diagnostic)| {
+                let diagnostic = diagnostic.clone();
+                BlockProperties {
+                    placement: BlockPlacement::Below(*anchor),
+                    height: Some(1),
+                    style: BlockStyle::Sticky,
+                    priority: 1,
+                    render: Arc::new(move |context| {
+                        let color = match diagnostic.severity {
+                            lsp::DiagnosticSeverity::WARNING => ui::Color::Warning,
+                            lsp::DiagnosticSeverity::INFORMATION => ui::Color::Info,
+                            lsp::DiagnosticSeverity::HINT => ui::Color::Hint,
+                            _ => ui::Color::Error,
+                        }
+                        .color(context.app);
+                        let gutter_width = context.margins.gutter.full_width();
+                        h_flex()
+                            .w_full()
+                            .items_start()
+                            .pl(gutter_width)
+                            .pr(context.margins.extended_right)
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w((context.anchor_x - gutter_width).max(px(0.)))
+                                    .max_w(relative(0.4)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .px_1()
+                                    .rounded_xs()
+                                    .bg(color.opacity(0.05))
+                                    .text_color(color)
+                                    .text_sm()
+                                    .font(context.editor_style.text.font())
+                                    .whitespace_normal()
+                                    .child(diagnostic.message.clone()),
+                            )
+                            .into_any()
+                    }),
+                }
+            }),
+            None,
+            cx,
+        );
+        self.overflow_diagnostic_blocks.extend(
+            pending
+                .into_iter()
+                .zip(blocks)
+                .map(|((anchor, diagnostic), block)| (anchor, (diagnostic, block))),
+        );
     }
 
     pub(super) fn remove_invalid_inline_diagnostics(
@@ -726,6 +821,73 @@ mod tests {
                 1,
                 "inline diagnostics should appear after the language server publishes them"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_inline_diagnostics_wrap_in_a_narrow_editor(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new(cx).await;
+        setup_inline_diagnostics(&mut cx);
+
+        for (width, expected_blocks) in [(1000., 0), (280., 1), (1000., 0)] {
+            let window = cx.window;
+            cx.cx
+                .cx
+                .simulate_window_resize(window, gpui::size(gpui::px(width), gpui::px(500.)));
+            cx.update(|window, app| {
+                window.refresh();
+                window.draw(app).clear(app);
+            });
+            cx.run_until_parked();
+            let gutter_width = cx.update_editor(|editor, _, _| {
+                assert_eq!(editor.overflow_diagnostic_blocks.len(), expected_blocks);
+                editor.gutter_dimensions.full_width()
+            });
+            if expected_blocks == 1 {
+                cx.update(|window, app| {
+                    window.refresh();
+                    window.draw(app).clear(app);
+                    let background = ui::Color::Error.color(app).opacity(0.05).into();
+                    let block = window
+                        .painted_quads()
+                        .into_iter()
+                        .find(|quad| quad.background == background)
+                        .expect("a diagnostic background below the source line");
+                    let scale = window.scale_factor();
+                    assert!(block.bounds.left() > gutter_width.scale(scale));
+                    assert!(block.bounds.right() <= gpui::px(width).scale(scale));
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_overflow_diagnostic_block_lifecycle(cx: &mut TestAppContext) {
+        use crate::DisplayRow;
+        use collections::HashMap;
+
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new(cx).await;
+        setup_inline_diagnostics(&mut cx);
+        cx.update_editor(|editor, _, cx| {
+            let (anchor, diagnostic) = editor.inline_diagnostics[0].clone();
+            let overflow = HashMap::from_iter([(anchor, diagnostic)]);
+            let diagnostic_row = DisplayRow(0)..DisplayRow(1);
+
+            editor.sync_overflow_diagnostics(diagnostic_row.clone(), overflow.clone(), cx);
+            let block = editor.overflow_diagnostic_blocks[&anchor].1;
+            assert_eq!(editor.row_for_block(block, cx), Some(DisplayRow(1)));
+
+            editor.sync_overflow_diagnostics(diagnostic_row.clone(), overflow, cx);
+            assert_eq!(editor.overflow_diagnostic_blocks[&anchor].1, block);
+
+            editor.sync_overflow_diagnostics(DisplayRow(1)..DisplayRow(2), HashMap::default(), cx);
+            assert_eq!(editor.overflow_diagnostic_blocks[&anchor].1, block);
+
+            editor.sync_overflow_diagnostics(diagnostic_row, HashMap::default(), cx);
+            assert!(editor.overflow_diagnostic_blocks.is_empty());
+            assert_eq!(editor.row_for_block(block, cx), None);
         });
     }
 
